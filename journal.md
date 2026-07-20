@@ -2,7 +2,7 @@
 
 **Issue link:** (https://github.com/ascherj/pathreview/issues/54)
 
-**Issue title:** Add a plan validation step that checks tool prerequisites before executing the plan
+**Issue title:** Add a plan validation step that checks tool prerequisites before executing the plan.
 
 **Tier:** [ ] Tier 1  [ ] Tier 2  [x] Tier 3
 
