@@ -8,6 +8,7 @@ from .error_handling import retry_with_backoff
 from .memory.context_manager import ContextManager
 from .memory.session_store import SessionStore
 from .tools.base import BaseTool, ToolResult
+from .tools.tool_dependencies import TOOL_DEPENDENCIES, PlanValidationError, validate_plan
 
 logger = structlog.get_logger()
 
@@ -45,23 +46,60 @@ class Orchestrator:
         # Build execution plan
         plan = self._build_plan(profile_data)
 
+        # Reject the plan up front if it violates the tool dependency graph
+        # (e.g. market_analyzer scheduled without tech_detector). Nothing
+        # executes until the whole plan is known to be valid.
+        try:
+            validate_plan(plan)
+        except PlanValidationError as e:
+            logger.error("plan_validation_failed", profile_id=profile_id, error=str(e))
+            return {
+                "profile_id": profile_id,
+                "tool_results": {},
+                "cached_results": self.context_manager.get_all_results(),
+                "error": str(e),
+            }
+
         # Load previous session state if available
         session_state = {}
         if self.session_store:
             session_state = self.session_store.get(profile_id) or {}
 
         # Execute plan
-        results = {}
+        results: dict[str, object] = {}
+        tool_success: dict[str, bool] = {}
         for tool_name, tool_input in plan:
+            # A tool can be correctly scheduled after its prerequisite and
+            # still be unsafe to run if that prerequisite failed at
+            # execution time (validate_plan only checks planned order, not
+            # actual outcomes). Skip it instead of running on failed input.
+            prerequisites = TOOL_DEPENDENCIES.get(tool_name, set())
+            failed_prerequisites = [p for p in prerequisites if tool_success.get(p) is False]
+
+            if failed_prerequisites:
+                logger.warning(
+                    "tool_skipped_failed_prerequisite",
+                    tool=tool_name,
+                    failed_prerequisites=failed_prerequisites,
+                )
+                results[tool_name] = {
+                    "error": f"prerequisite failed: {failed_prerequisites[0]}",
+                    "success": False,
+                }
+                tool_success[tool_name] = False
+                continue
+
             try:
                 result = self._execute_tool(tool_name, tool_input)
                 results[tool_name] = result.data if hasattr(result, "data") else result
+                tool_success[tool_name] = getattr(result, "success", True)
 
-                logger.info("tool_executed", tool=tool_name, success=True)
+                logger.info("tool_executed", tool=tool_name, success=tool_success[tool_name])
 
             except Exception as e:
                 logger.error("tool_execution_failed", tool=tool_name, error=str(e))
                 results[tool_name] = {"error": str(e), "success": False}
+                tool_success[tool_name] = False
 
         # Persist state
         if self.session_store:
